@@ -660,6 +660,52 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
         rel_err = ((recovered - weight).abs().sum() / weight.abs().sum()).item()
         self.assertLess(rel_err, 5e-2)  # fp8 round-trip is ~2e-2; a scale mismatch inflates it past 0.2
 
+    def test_fp8_dequantize_rows_tiled_in_padded_chunks(self):
+        # A fused projection stored as equal row chunks, each tiled on its own 128-row grid with
+        # the last tile padded (MiMo-V2.6's ``qkv_proj``: 4 chunks of 3392 rows -> 27 scale rows
+        # each, 108 in total). Spreading the 108 scale rows evenly over 13568 rows would use one
+        # scale row per 126 rows and drift inside every chunk.
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+        torch.manual_seed(0)
+        rows, cols, chunks, block = 13568, 256, 4, 128
+        chunk_rows = rows // chunks
+        weight = torch.randn(rows, cols) * torch.exp2(torch.randint(-4, 5, (rows, 1)).float())
+        quantized, scales, expected = [], [], []
+        for chunk in weight.split(chunk_rows):
+            tiles = -(-chunk_rows // block)
+            padded = torch.zeros(tiles * block, cols)
+            padded[:chunk_rows] = chunk
+            scale = padded.view(tiles, block, cols // block, block).abs().amax((1, 3)) / 448.0
+            expanded = scale.repeat_interleave(block, 0).repeat_interleave(block, 1)[:chunk_rows]
+            q = (chunk / expanded).to(torch.float8_e4m3fn)
+            quantized.append(q)
+            scales.append(scale)
+            expected.append(q.float() * expanded)
+        quantized, scales, expected = torch.cat(quantized), torch.cat(scales), torch.cat(expected)
+        self.assertEqual(scales.shape, (108, 2))
+
+        recovered = Fp8Dequantize(None)._dequantize_one(quantized, scales, output_dtype=torch.float32)
+        torch.testing.assert_close(recovered, expected, rtol=0, atol=0)
+
+        # A scale row count that fits no chunking is still rejected.
+        with self.assertRaises(ValueError):
+            Fp8Dequantize(None)._dequantize_one(quantized, scales[:-1], output_dtype=torch.float32)
+
+    def test_fp8_dequantize_unpacks_uint8_fp4_with_e8m0_scales(self):
+        # MXFP4 experts stored as two e2m1 nibbles per ``uint8`` byte, one e8m0 exponent byte per
+        # 32 values (``store_dtype: mxfp4`` checkpoints); the ``int8`` spelling was already handled.
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+        lut = torch.tensor(Fp8Dequantize._FP4_E2M1_LUT)
+        nibbles = torch.randint(0, 16, (8, 64))
+        packed = (nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)).to(torch.uint8)
+        exponents = torch.randint(120, 134, (8, 2))
+        expected = lut[nibbles] * torch.exp2(exponents.float() - 127).repeat_interleave(32, dim=1)
+
+        recovered = Fp8Dequantize(None)._dequantize_one(packed, exponents.to(torch.uint8), output_dtype=torch.float32)
+        torch.testing.assert_close(recovered, expected, rtol=0, atol=0)
+
     def test_fp8_float_scale_fmt_quantization_unchanged(self):
         # The ue8m0 reordering must leave the default scale_fmt="float" path bit-identical to the
         # original single-division formula (scales = _FP8_MAX / max_abs). Any divergence only shows

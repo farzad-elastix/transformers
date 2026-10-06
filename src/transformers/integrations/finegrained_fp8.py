@@ -1037,13 +1037,31 @@ class Fp8Dequantize(ConversionOps):
         unpacked = torch.stack([lut[low], lut[high]], dim=-1)
         return unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
+    @staticmethod
+    def _scale_row_index(rows: int, scale_rows: int, block: int) -> torch.Tensor:
+        """Scale row of each weight row when the rows are tiled in equal chunks.
+
+        Some checkpoints store a fused projection as ``n`` row chunks, each tiled on its own
+        ``block``-row grid with its last tile padded (e.g. MiMo-V2.6's ``qkv_proj``: 13568 rows in 4
+        chunks of 3392, 27 scale rows each, 108 in total, where a plain grid would have 106). The
+        chunk count is the one ``n`` dividing ``rows`` with ``n * ceil(rows / n / block)`` scale rows.
+        """
+        fits = [n for n in range(1, scale_rows + 1) if rows % n == 0 and n * -(-(rows // n) // block) == scale_rows]
+        # Several chunk counts can fit when the chunks are block-aligned; they tile the same way,
+        # so the smallest one is canonical.
+        if not fits:
+            raise ValueError(f"{rows} rows cannot be tiled into {scale_rows} scale rows of {block}-row blocks.")
+        chunk = rows // fits[0]
+        index = torch.arange(rows)
+        return index // chunk * (scale_rows // fits[0]) + index % chunk // block
+
     def _dequantize_one(
         self, quantized: torch.Tensor, scales: torch.Tensor, output_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
-        # FP4 path: int8 / float4_e2m1fn_x2 stores two nibbles per byte. Unpack to fp32
+        # FP4 path: int8 / uint8 / float4_e2m1fn_x2 store two nibbles per byte. Unpack to fp32
         # first so the rest of the routine sees a normal (rows, cols) float matrix.
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if quantized.dtype == torch.int8 or (fp4_dtype is not None and quantized.dtype == fp4_dtype):
+        if quantized.dtype in (torch.int8, torch.uint8) or (fp4_dtype is not None and quantized.dtype == fp4_dtype):
             quantized_fp32 = self._unpack_fp4(quantized)
         else:
             quantized_fp32 = quantized.to(torch.float32)
@@ -1056,11 +1074,10 @@ class Fp8Dequantize(ConversionOps):
         except Exception:
             # scale can be a single tensor in extreme cases where it was not wrapped properly but is [1,0].
             scale_rows, scale_cols = 1, 1
-        if rows % scale_rows or cols % scale_cols:
+        if cols % scale_cols:
             raise ValueError(
                 f"Weight shape ({rows}, {cols}) not divisible by scale grid ({scale_rows}, {scale_cols})."
             )
-        block_m = rows // scale_rows
         block_n = cols // scale_cols
         # ``ue8m0`` (``float8_e8m0fnu``) scales have no CUDA ``mul`` kernel, and casting
         # the FP8 weight to that dtype loses precision. Promote both sides to fp32 for
@@ -1078,9 +1095,16 @@ class Fp8Dequantize(ConversionOps):
         else:
             s_fp32 = scales.to(torch.float32)
         original_shape = quantized_fp32.shape
-        q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
-        s = s_fp32.reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
-        return (q * s).to(output_dtype).reshape(original_shape)
+        if rows % scale_rows == 0:
+            block_m = rows // scale_rows
+            q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
+            s = s_fp32.reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
+            return (q * s).to(output_dtype).reshape(original_shape)
+        # Rows tiled in chunks, each padded to whole blocks: expand the scales row by row.
+        row_scale = self._scale_row_index(rows, scale_rows, block_n).to(scales.device)
+        s = s_fp32.reshape(-1, scale_rows, scale_cols)[:, row_scale, :]
+        s = s.repeat_interleave(block_n, dim=-1)
+        return (quantized_fp32.reshape(-1, rows, cols) * s).to(output_dtype).reshape(original_shape)
 
     def _get_target_dtype(self, model: torch.nn.Module | None, full_layer_name: str | None) -> torch.dtype | None:
         if model is None or full_layer_name is None:
